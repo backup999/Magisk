@@ -82,8 +82,11 @@ abstract class MagiskInstallImpl protected constructor(
         }
     }
 
-    private fun findImage(): Boolean {
-        val bootPath = "RECOVERYMODE=${Config.recovery} find_boot_image; echo \"\$BOOTIMAGE\"".fsh()
+    private fun findImage(slot: String): Boolean {
+        val bootPath = (
+            "(RECOVERYMODE=${Config.recovery} " +
+            "SLOT=$slot find_boot_image; " +
+            "echo \$BOOTIMAGE)").fsh()
         if (bootPath.isEmpty()) {
             console.add("! Unable to detect target image")
             return false
@@ -93,22 +96,14 @@ abstract class MagiskInstallImpl protected constructor(
         return true
     }
 
+    private fun findImage(): Boolean {
+        return findImage(Info.slot)
+    }
+
     private fun findSecondary(): Boolean {
-        val slot = "echo \$SLOT".fsh()
-        val target = if (slot == "_a") "_b" else "_a"
-        console.add("- Target slot: $target")
-        val bootPath = arrayOf(
-            "SLOT=$target",
-            "find_boot_image",
-            "SLOT=$slot",
-            "echo \"\$BOOTIMAGE\"").fsh()
-        if (bootPath.isEmpty()) {
-            console.add("! Unable to detect target image")
-            return false
-        }
-        srcBoot = rootFS.getFile(bootPath)
-        console.add("- Target image: $bootPath")
-        return true
+        val slot = if (Info.slot == "_a") "_b" else "_a"
+        console.add("- Target slot: $slot")
+        return findImage(slot)
     }
 
     private suspend fun extractFiles(): Boolean {
@@ -226,10 +221,10 @@ abstract class MagiskInstallImpl protected constructor(
         tarOut: TarArchiveOutputStream
     ): BootItem {
         console.add("- Processing tar file")
-        lateinit var entry: TarArchiveEntry
+        var entry: TarArchiveEntry? = tarIn.nextEntry
 
-        fun decompressedStream(): InputStream {
-            val stream = if (entry.name.endsWith(".lz4"))
+        fun TarArchiveEntry.decompressedStream(): InputStream {
+            val stream = if (name.endsWith(".lz4"))
                 FramedLZ4CompressorInputStream(tarIn, true) else tarIn
             return NoAvailableStream(stream)
         }
@@ -238,9 +233,7 @@ abstract class MagiskInstallImpl protected constructor(
         var initBoot: BootItem? = null
         var recovery: BootItem? = null
 
-        while (true) {
-            entry = tarIn.nextEntry ?: break
-
+        while (entry != null) {
             val bootItem: BootItem?
             if (entry.name.startsWith("boot.img")) {
                 bootItem = BootItem(entry)
@@ -257,9 +250,9 @@ abstract class MagiskInstallImpl protected constructor(
 
             if (bootItem != null) {
                 console.add("-- Extracting: ${bootItem.name}")
-                decompressedStream().copyAndCloseOut(bootItem.file.newOutputStream())
+                entry.decompressedStream().copyAndCloseOut(bootItem.file.newOutputStream())
             } else if (entry.name.contains("vbmeta.img")) {
-                val rawData = decompressedStream().readBytes()
+                val rawData = entry.decompressedStream().readBytes()
                 // Valid vbmeta.img should be at least 256 bytes
                 if (rawData.size < 256)
                     continue
@@ -274,23 +267,28 @@ abstract class MagiskInstallImpl protected constructor(
                 // AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED
                 ByteBuffer.wrap(rawData).putInt(120, 3)
 
+                // Fetch the next entry first before modifying current entry
+                val vbmeta = entry
+                entry = tarIn.nextEntry
+
                 // Update entry with new information
-                entry.name = name
-                entry.size = rawData.size.toLong()
+                vbmeta.name = name
+                vbmeta.size = rawData.size.toLong()
 
                 // Write output
-                tarOut.putArchiveEntry(entry)
+                tarOut.putArchiveEntry(vbmeta)
                 tarOut.write(rawData)
                 tarOut.closeArchiveEntry()
+                continue
             } else if (entry.name.contains("userdata.img")) {
                 console.add("-- Skipping  : ${entry.name}")
-                continue
             } else {
                 console.add("-- Copying   : ${entry.name}")
                 tarOut.putArchiveEntry(entry)
                 tarIn.copyAll(tarOut, bufferSize = 1024 * 1024)
                 tarOut.closeArchiveEntry()
             }
+            entry = tarIn.nextEntry ?: break
         }
 
         // Patch priority: recovery > init_boot > boot
